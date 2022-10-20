@@ -140,7 +140,8 @@ static void print_progress(size_t bytes_copied,
     format_size(bytes_str, sizeof(bytes_str), bytes_copied);
     format_speed(speed_str, sizeof(speed_str), speed);
 
-    printf("%zu B (%s) copied, %0.1f s, %s\n",
+    fprintf(stderr,
+           "%zu B (%s) copied, %0.1f s, %s\n",
            bytes_copied,
            bytes_str,
            (double)elapsed_time / (double)UPDATE_INTERVAL,
@@ -163,7 +164,7 @@ static void clear_output(void)
     DWORD num_chars_written;
     CONSOLE_SCREEN_BUFFER_INFO buffer_info;
 
-    console = GetStdHandle(STD_OUTPUT_HANDLE);
+    console = GetStdHandle(STD_ERROR_HANDLE);
     GetConsoleScreenBufferInfo(console, &buffer_info);
     start_coord.Y = buffer_info.dwCursorPosition.Y - 1;
     FillConsoleOutputCharacterA(
@@ -351,53 +352,82 @@ int main(int argc, char **argv)
     state.bytes_write = 0;
     state.blocks_copied = 0;
 
-    state.in_file = CreateFileA(
-        options.filename_in,
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-        NULL);
-    if (state.in_file == INVALID_HANDLE_VALUE)
+    if (strcmp(options.filename_in, "-") == 0)
     {
-        exit_on_error(
-            &state,
-            GetLastError(),
-            "Could not open input file or device %s for reading",
-            options.filename_in);
+        state.in_file = GetStdHandle(STD_INPUT_HANDLE);
+        if (state.in_file == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                &state,
+                GetLastError(),
+                "Could not open stdin for reading");
+        }
+    }
+    else
+    {
+
+        state.in_file = CreateFileA(
+            options.filename_in,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            NULL);
+        if (state.in_file == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                &state,
+                GetLastError(),
+                "Could not open input file or device %s for reading",
+                options.filename_in);
+        }
     }
 
-    /* First try to open as an existing file, thne as a new file. We can't
-     * use OPEN_ALWAYS because it fails when out_file is a physical drive
-     * (no idea why).
-     */
-    state.out_file = CreateFileA(
-        options.filename_out,
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
-    if (state.out_file == INVALID_HANDLE_VALUE)
+    if (strcmp(options.filename_out, "-") == 0)
     {
+        state.out_file = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (state.out_file == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                &state,
+                GetLastError(),
+                "Could not open stdout for writing");
+        }
+    }
+    else
+    {
+        /* First try to open as an existing file, thne as a new file. We can't
+         * use OPEN_ALWAYS because it fails when out_file is a physical drive
+         * (no idea why).
+         */
         state.out_file = CreateFileA(
             options.filename_out,
             GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             NULL,
-            CREATE_ALWAYS,
+            OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             NULL);
-    }
-    if (state.out_file == INVALID_HANDLE_VALUE)
-    {
-        exit_on_error(
-            &state,
-            GetLastError(),
-            "Could not open output file or device %s for writing",
-            options.filename_out);
+        if (state.out_file == INVALID_HANDLE_VALUE)
+        {
+            state.out_file = CreateFileA(
+                options.filename_out,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                NULL);
+        }
+        if (state.out_file == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                &state,
+                GetLastError(),
+                "Could not open output file or device %s for writing",
+                options.filename_out);
+        }
     }
 
     state.buffer_size = DEFAULT_BUFFER_SIZE;
@@ -458,6 +488,7 @@ int main(int argc, char **argv)
         exit_on_error(&state, GetLastError(), "Failed to allocate buffer");
     }
 
+    fprintf(stderr, "\n");
     show_progress = (options.status != NULL && strcmp(options.status, "progress") == 0);
     state.started_copying = TRUE;
 
