@@ -28,6 +28,7 @@
 #define UNIT_GiB (1 << 30)
 #define DEFAULT_BUFFER_SIZE 4096
 #define UPDATE_INTERVAL 1000000
+#define BUFFER_COUNT 2
 
 #ifdef _MSC_VER
     #define strdup _strdup
@@ -50,13 +51,22 @@ struct program_state
     HANDLE in_file;
     HANDLE out_file;
     DWORD buffer_size;
-    char *buffer;
+    char *buffer[BUFFER_COUNT];
     BOOL out_file_is_device;
     BOOL started_copying;
     ULONGLONG start_time;
     size_t bytes_read;
     size_t bytes_write;
-    size_t blocks_copied;
+    size_t blocks_read;
+    size_t blocks_write;
+    size_t count;
+    HANDLE semaphore_buffer_ready;
+    HANDLE semaphore_buffer_occupied;
+    HANDLE mutex_progress_display;
+    HANDLE handle_thread_read;
+    HANDLE handle_thread_write;
+    DWORD bytes_read_per_block[BUFFER_COUNT];
+    DWORD bytes_write_per_block;
 };
 
 static void print_usage(void)
@@ -144,7 +154,7 @@ static void print_progress(size_t bytes_copied,
            "%zu B (%s) copied, %0.1f s, %s\n",
            bytes_copied,
            bytes_str,
-           (double)elapsed_time / (double)UPDATE_INTERVAL,
+           (double)elapsed_time / 1000000.0,
            speed_str);
 }
 
@@ -193,7 +203,10 @@ static char *get_error_message(DWORD error)
 
 static void cleanup(const struct program_state *state)
 {
-    VirtualFree(state->buffer, 0, MEM_RELEASE);
+    for (int i = 0; i < BUFFER_COUNT; i++)
+    {
+        VirtualFree(state->buffer[i], 0, MEM_RELEASE);
+    }
 
     if (state->out_file_is_device)
     {
@@ -204,9 +217,30 @@ static void cleanup(const struct program_state *state)
     {
         CloseHandle(state->in_file);
     }
+
     if (state->out_file != INVALID_HANDLE_VALUE)
     {
         CloseHandle(state->out_file);
+    }
+
+    if (state->handle_thread_read != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(state->handle_thread_read);
+    }
+
+    if (state->handle_thread_write != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(state->handle_thread_write);
+    }
+
+    if (state->semaphore_buffer_ready != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(state->semaphore_buffer_ready);
+    }
+
+    if (state->semaphore_buffer_occupied != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(state->semaphore_buffer_occupied);
     }
 }
 
@@ -272,15 +306,13 @@ static BOOL parse_options(int argc,
                           char **argv,
                           struct program_options *options)
 {
-    int i;
-
     options->filename_in = NULL;
     options->filename_out = NULL;
     options->block_size = 0;
     options->count = -1;
     options->status = NULL;
 
-    for (i = 1; i < argc; i++)
+    for (int i = 1; i < argc; i++)
     {
         char *value = NULL;
         char *name = strtok_r(argv[i], "=", &value);
@@ -319,6 +351,85 @@ static BOOL parse_options(int argc,
     return (is_empty_string(options->filename_in) || is_empty_string(options->filename_out)) == FALSE;
 }
 
+DWORD WINAPI thread_read(struct program_state *state)
+{
+    BOOL result;
+    DWORD buffer_index;
+
+    while (1)
+    {
+        if (state->count >= 0 && state->blocks_read >= state->count)
+        {
+            break;
+        }
+        buffer_index = state->blocks_read % BUFFER_COUNT;
+        WaitForSingleObject(state->semaphore_buffer_ready, -1);
+        result = ReadFile(
+            state->in_file,
+            state->buffer[buffer_index],
+            state->buffer_size,
+            &(state->bytes_read_per_block[buffer_index]),
+            NULL);
+        if (state->bytes_read_per_block[buffer_index] == 0 || (!result && GetLastError() == ERROR_SECTOR_NOT_FOUND))
+        {
+            ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
+            break;
+        }
+        if (result == FALSE)
+        {
+            ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
+            exit_on_error(state, GetLastError(), "Error reading from file");
+        }
+
+        state->bytes_read += state->bytes_read_per_block[buffer_index];
+        state->blocks_read++;
+        ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
+    }
+    return 1;
+}
+
+DWORD WINAPI thread_write(struct program_state *state)
+{
+    BOOL result;
+    DWORD buffer_index;
+
+    while (1)
+    {
+        if (state->mutex_progress_display != INVALID_HANDLE_VALUE)
+        {
+            ReleaseSemaphore(state->mutex_progress_display, 1, NULL);
+        }
+        if (state->count >= 0 && state->blocks_write >= state->count)
+        {
+            break;
+        }
+        buffer_index = state->blocks_write % BUFFER_COUNT;
+        WaitForSingleObject(state->semaphore_buffer_occupied, -1);
+        if (state->bytes_read_per_block[buffer_index] == 0)
+        {
+            ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
+            break;
+        }
+        result = WriteFile(
+            state->out_file,
+            state->buffer[buffer_index],
+            state->bytes_read_per_block[buffer_index],
+            &(state->bytes_write_per_block),
+            NULL);
+        if (result == FALSE)
+        {
+            ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
+            exit_on_error(state, GetLastError(), "Error writing to file");
+        }
+
+        state->bytes_write += state->bytes_write_per_block;
+        state->blocks_write++;
+        ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
+    }
+    state->started_copying = FALSE;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     struct program_options options;
@@ -345,12 +456,14 @@ int main(int argc, char **argv)
     ZeroMemory(&state, sizeof(state));
     state.in_file = INVALID_HANDLE_VALUE;
     state.out_file = INVALID_HANDLE_VALUE;
+    state.mutex_progress_display = INVALID_HANDLE_VALUE;
     state.start_time = get_time_usec();
     state.out_file_is_device = FALSE;
     state.started_copying = FALSE;
     state.bytes_read = 0;
     state.bytes_write = 0;
-    state.blocks_copied = 0;
+    state.blocks_read = 0;
+    state.blocks_write = 0;
 
     if (strcmp(options.filename_in, "-") == 0)
     {
@@ -478,34 +591,39 @@ int main(int argc, char **argv)
         }
     }
 
-    state.buffer = VirtualAlloc(
-        NULL,
-        state.buffer_size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE);
-    if (state.buffer == NULL)
+    for (int i = 0; i < BUFFER_COUNT; i++)
     {
-        exit_on_error(&state, GetLastError(), "Failed to allocate buffer");
+        state.buffer[i] = VirtualAlloc(
+            NULL,
+            state.buffer_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE);
+        if (state.buffer[i] == NULL)
+        {
+            exit_on_error(&state, GetLastError(), "Failed to allocate buffer");
+        }
     }
+    state.count = options.count;
 
     fprintf(stderr, "\n");
     show_progress = (options.status != NULL && strcmp(options.status, "progress") == 0);
     state.started_copying = TRUE;
 
-    for (;;)
+    state.semaphore_buffer_ready = CreateSemaphore(NULL, BUFFER_COUNT, BUFFER_COUNT, NULL);
+    state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, BUFFER_COUNT, NULL);
+    if (show_progress == TRUE)
     {
-        DWORD num_block_bytes_in;
-        DWORD num_block_bytes_out;
-        BOOL result;
-        ULONGLONG current_time;
+        state.mutex_progress_display = CreateSemaphore(NULL, 0, 1, NULL);
+    }
+    state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read, &state, 0, NULL);
+    state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write, &state, 0, NULL);
 
-        if (options.count >= 0 && state.blocks_copied >= options.count)
+    if (show_progress == TRUE)
+    {
+        while (state.started_copying == TRUE)
         {
-            break;
-        }
-
-        if (show_progress)
-        {
+            ULONGLONG current_time;
+            WaitForSingleObject(state.mutex_progress_display, -1);
             current_time = get_time_usec();
             if (last_time == 0)
             {
@@ -526,38 +644,11 @@ int main(int argc, char **argv)
                 }
             }
         }
-
-        result = ReadFile(
-            state.in_file,
-            state.buffer,
-            state.buffer_size,
-            &num_block_bytes_in,
-            NULL);
-        if (num_block_bytes_in == 0 || (result == FALSE && GetLastError() == ERROR_SECTOR_NOT_FOUND))
-        {
-            break;
-        }
-        if (result == FALSE)
-        {
-            exit_on_error(&state, GetLastError(), "Error reading from file");
-        }
-
-        state.bytes_read += num_block_bytes_in;
-
-        result = WriteFile(
-            state.out_file,
-            state.buffer,
-            num_block_bytes_in,
-            &num_block_bytes_out,
-            NULL);
-        if (result == FALSE)
-        {
-            exit_on_error(&state, GetLastError(), "Error writing to file");
-        }
-
-        state.bytes_write += num_block_bytes_out;
-        state.blocks_copied++;
+        CloseHandle(state.mutex_progress_display);
     }
+
+    WaitForSingleObject(state.handle_thread_read, -1);
+    WaitForSingleObject(state.handle_thread_write, -1);
 
     cleanup(&state);
     clear_output();
