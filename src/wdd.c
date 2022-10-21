@@ -153,11 +153,11 @@ static void print_progress(size_t bytes_copied,
     format_speed(speed_str, sizeof(speed_str), speed);
 
     fprintf(stderr,
-           "%zu B (%s) copied, %0.1f s, %s\n",
-           bytes_copied,
-           bytes_str,
-           (double)elapsed_time / 1000000.0,
-           speed_str);
+            "%zu B (%s) copied, %0.1f s, %s\n",
+            bytes_copied,
+            bytes_str,
+            (double)elapsed_time / 1000000.0,
+            speed_str);
 }
 
 static void print_status(size_t bytes_copied, ULONGLONG start_time)
@@ -210,14 +210,14 @@ static void cleanup(const struct program_state *state)
         VirtualFree(state->buffer[i], 0, MEM_RELEASE);
     }
 
-    if (state->out_file_is_device)
-    {
-        DeviceIoControl(state->out_file, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, NULL, NULL);
-    }
-
     if (state->in_file != INVALID_HANDLE_VALUE)
     {
         CloseHandle(state->in_file);
+    }
+
+    if (state->out_file_is_device)
+    {
+        DeviceIoControl(state->out_file, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, NULL, NULL);
     }
 
     if (state->out_file != INVALID_HANDLE_VALUE)
@@ -269,7 +269,7 @@ static void exit_on_error(const struct program_state *state,
     fprintf(stderr, "%s\n", reason);
     LocalFree(reason);
 
-    if (state->started_copying)
+    if (state->started_copying == TRUE)
     {
         print_status(state->bytes_write, state->start_time);
     }
@@ -321,6 +321,7 @@ static BOOL parse_options(int argc,
     options->count = 0;
     options->skip_offset.QuadPart = 0;
     options->seek_offset.QuadPart = 0;
+
     for (int i = 1; i < argc; i++)
     {
         char *value = NULL;
@@ -368,11 +369,11 @@ static BOOL parse_options(int argc,
     {
         return FALSE;
     }
-    if (is_empty_string(options->filename_in))
+    if (is_empty_string(options->filename_in) == TRUE)
     {
         options->filename_in = "-";
     }
-    if (is_empty_string(options->filename_out))
+    if (is_empty_string(options->filename_out) == TRUE)
     {
         options->filename_out = "-";
     }
@@ -380,7 +381,7 @@ static BOOL parse_options(int argc,
     {
         return FALSE;
     }
-    if (options->seek_offset.QuadPart <0)
+    if (options->seek_offset.QuadPart < 0)
     {
         return FALSE;
     }
@@ -416,7 +417,7 @@ DWORD WINAPI thread_read(struct program_state *state)
 
     while (1)
     {
-        if (state->block_count >= 0 && state->blocks_read >= state->block_count)
+        if (state->block_count > 0 && state->blocks_read >= state->block_count)
         {
             break;
         }
@@ -428,7 +429,7 @@ DWORD WINAPI thread_read(struct program_state *state)
             state->buffer_size,
             &(state->bytes_read_per_block[buffer_index]),
             NULL);
-        if (state->bytes_read_per_block[buffer_index] == 0 || (!result && GetLastError() == ERROR_SECTOR_NOT_FOUND))
+        if (state->bytes_read_per_block[buffer_index] == 0 || (result == FALSE && GetLastError() == ERROR_SECTOR_NOT_FOUND))
         {
             ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
             break;
@@ -457,7 +458,7 @@ DWORD WINAPI thread_write(struct program_state *state)
         {
             ReleaseSemaphore(state->mutex_progress_display, 1, NULL);
         }
-        if (state->block_count >= 0 && state->blocks_write >= state->block_count)
+        if (state->block_count > 0 && state->blocks_write >= state->block_count)
         {
             break;
         }
@@ -558,7 +559,7 @@ int main(int argc, char **argv)
             exit_on_error(
                 &state,
                 GetLastError(),
-                "Input file seek failed. Requested offset: %zi",
+                "Input file seek failed. Requested offset: %li",
                 options.skip_offset.QuadPart);
         }
     }
@@ -613,7 +614,7 @@ int main(int argc, char **argv)
             exit_on_error(
                 &state,
                 GetLastError(),
-                "Output file seek failed. Requested offset: %zi",
+                "Output file seek failed. Requested offset: %li",
                 options.seek_offset.QuadPart);
         }
     }
@@ -665,7 +666,9 @@ int main(int argc, char **argv)
                 requested_size = (requested_size + sector_size) & ~sector_size;
                 state.block_count = requested_size / state.buffer_size;
                 if (state.block_count != original_block_count)
-                fprintf(stderr, "Block count changed. Requested: %zi Real: %zi\n", state.block_count, original_block_count);
+                {
+                    fprintf(stderr, "Block count changed. Requested: %zi Real: %zi\n", state.block_count, original_block_count);
+                }
             }
         }
     }
@@ -674,17 +677,18 @@ int main(int argc, char **argv)
         state.buffer_size = (DWORD)options.block_size; // TODO: Possible bug with bs > 4GB
     }
 
-    size_t large_page_size = GetLargePageMinimum();
     DWORD large_page_buffer_size;
-    if (state.buffer_size >= large_page_size && enable_windows_privilege("SeLockMemoryPrivilege"))
+    if (enable_windows_privilege("SeLockMemoryPrivilege") == TRUE)
     {
+        size_t large_page_size = GetLargePageMinimum();
         fprintf(stderr, "LargePage support enabled, size: %zi\n", large_page_size);
         large_page_size--;
         large_page_buffer_size = (DWORD)((state.buffer_size + large_page_size) & ~large_page_size);
+        use_large_pages = TRUE;
     }
     for (int i = 0; i < BUFFER_COUNT; i++)
     {
-        if (use_large_pages)
+        if (use_large_pages == TRUE)
         {
             state.buffer[i] = VirtualAlloc(
                 NULL,
@@ -693,9 +697,9 @@ int main(int argc, char **argv)
                 PAGE_READWRITE);
             if (state.buffer[i] != NULL)
             {
-                fprintf(stderr, "Buffer %i large pages allocation failed, fall back to normal allocation.\n", i);
                 continue;
             }
+            fprintf(stderr, "Buffer %i large pages allocation failed, fall back to normal allocation.\n", i);
         }
         state.buffer[i] = VirtualAlloc(
             NULL,
