@@ -44,6 +44,8 @@ struct program_options
     const char *filename_out;
     size_t block_size;
     size_t count;
+    LARGE_INTEGER skip_offset;
+    LARGE_INTEGER seek_offset;
 };
 
 struct program_state
@@ -71,7 +73,7 @@ struct program_state
 
 static void print_usage(void)
 {
-    fprintf(stderr, "Usage: wdd [if=<in_file>] [of=<out_file>] [bs=N] [count=N] [progress]\n");
+    fprintf(stderr, "Usage: wdd [if=<in_file>] [of=<out_file>] [bs=N] [count=N] [skip=N] [seek=N] [progress]\n");
 }
 
 static ULONGLONG get_time_usec(void)
@@ -317,7 +319,8 @@ static BOOL parse_options(int argc,
     options->filename_out = "-";
     options->block_size = 0;
     options->count = 0;
-
+    options->skip_offset.QuadPart = 0;
+    options->seek_offset.QuadPart = 0;
     for (int i = 1; i < argc; i++)
     {
         char *value = NULL;
@@ -348,6 +351,14 @@ static BOOL parse_options(int argc,
         {
             options->show_progress = TRUE;
         }
+        else if (strcmp(name, "skip") == 0)
+        {
+            options->skip_offset.QuadPart = parse_size(value);
+        }
+        else if (strcmp(name, "seek") == 0)
+        {
+            options->seek_offset.QuadPart = parse_size(value);
+        }
         else
         {
             return FALSE;
@@ -364,6 +375,14 @@ static BOOL parse_options(int argc,
     if (is_empty_string(options->filename_out))
     {
         options->filename_out = "-";
+    }
+    if (options->skip_offset.QuadPart < 0)
+    {
+        return FALSE;
+    }
+    if (options->seek_offset.QuadPart <0)
+    {
+        return FALSE;
     }
     return TRUE;
 }
@@ -518,7 +537,6 @@ int main(int argc, char **argv)
     }
     else
     {
-
         state.in_file = CreateFile(
             options.filename_in,
             GENERIC_READ,
@@ -534,6 +552,14 @@ int main(int argc, char **argv)
                 GetLastError(),
                 "Could not open input file or device %s for reading",
                 options.filename_in);
+        }
+        if (SetFilePointer(state.in_file, options.skip_offset.LowPart, &options.skip_offset.HighPart, 0) == INVALID_SET_FILE_POINTER)
+        {
+            exit_on_error(
+                &state,
+                GetLastError(),
+                "Input file seek failed. Requested offset: %zi",
+                options.skip_offset.QuadPart);
         }
     }
 
@@ -580,6 +606,15 @@ int main(int argc, char **argv)
                 GetLastError(),
                 "Could not open output file or device %s for writing",
                 options.filename_out);
+        }
+
+        if (SetFilePointer(state.out_file, options.seek_offset.LowPart, &options.seek_offset.HighPart, 0) == INVALID_SET_FILE_POINTER)
+        {
+            exit_on_error(
+                &state,
+                GetLastError(),
+                "Output file seek failed. Requested offset: %zi",
+                options.seek_offset.QuadPart);
         }
     }
 
