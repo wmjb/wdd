@@ -39,11 +39,11 @@
 struct program_options
 {
     BOOL print_drive_list;
+    BOOL show_progress;
     const char *filename_in;
     const char *filename_out;
     size_t block_size;
     size_t count;
-    const char *status;
 };
 
 struct program_state
@@ -59,7 +59,7 @@ struct program_state
     size_t bytes_write;
     size_t blocks_read;
     size_t blocks_write;
-    size_t count;
+    size_t block_count;
     HANDLE semaphore_buffer_ready;
     HANDLE semaphore_buffer_occupied;
     HANDLE mutex_progress_display;
@@ -71,7 +71,7 @@ struct program_state
 
 static void print_usage(void)
 {
-    fprintf(stderr, "Usage: wdd if=<in_file> of=<out_file> [bs=N] [count=N] [status=progress]\n");
+    fprintf(stderr, "Usage: wdd [if=<in_file>] [of=<out_file>] [bs=N] [count=N] [progress]\n");
 }
 
 static ULONGLONG get_time_usec(void)
@@ -177,7 +177,7 @@ static void clear_output(void)
     console = GetStdHandle(STD_ERROR_HANDLE);
     GetConsoleScreenBufferInfo(console, &buffer_info);
     start_coord.Y = buffer_info.dwCursorPosition.Y - 1;
-    FillConsoleOutputCharacterA(
+    FillConsoleOutputCharacter(
         console,
         ' ',
         buffer_info.dwSize.X,
@@ -190,7 +190,7 @@ static char *get_error_message(DWORD error)
 {
     char *buffer = NULL;
 
-    FormatMessageA(
+    FormatMessage(
         FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
         NULL,
         error,
@@ -241,6 +241,11 @@ static void cleanup(const struct program_state *state)
     if (state->semaphore_buffer_occupied != INVALID_HANDLE_VALUE)
     {
         CloseHandle(state->semaphore_buffer_occupied);
+    }
+
+    if (state->mutex_progress_display != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(state->mutex_progress_display);
     }
 }
 
@@ -306,11 +311,12 @@ static BOOL parse_options(int argc,
                           char **argv,
                           struct program_options *options)
 {
-    options->filename_in = NULL;
-    options->filename_out = NULL;
+    options->print_drive_list = FALSE;
+    options->show_progress = FALSE;
+    options->filename_in = "-";
+    options->filename_out = "-";
     options->block_size = 0;
-    options->count = -1;
-    options->status = NULL;
+    options->count = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -338,17 +344,50 @@ static BOOL parse_options(int argc,
         {
             options->count = (size_t)strtoll(value, NULL, 10);
         }
-        else if (strcmp(name, "status") == 0)
+        else if (strcmp(name, "progress") == 0)
         {
-            options->status = strdup(value);
+            options->show_progress = TRUE;
         }
         else
         {
             return FALSE;
         }
     }
+    if (options->count > 0 && options->block_size <= 0)
+    {
+        return FALSE;
+    }
+    if (is_empty_string(options->filename_in))
+    {
+        options->filename_in = "-";
+    }
+    if (is_empty_string(options->filename_out))
+    {
+        options->filename_out = "-";
+    }
+    return TRUE;
+}
 
-    return (is_empty_string(options->filename_in) || is_empty_string(options->filename_out)) == FALSE;
+static BOOL enable_windows_privilege(LPSTR requested_privilege)
+{
+    /* Tries to enable privilege if it is present to the Permissions set. */
+    HANDLE handle_current_token;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &handle_current_token) == FALSE)
+    {
+        return FALSE;
+    }
+    TOKEN_PRIVILEGES token_privileges;
+    if (LookupPrivilegeValue(NULL, requested_privilege, &(token_privileges.Privileges[0].Luid)) == FALSE)
+    {
+        return FALSE;
+    }
+    token_privileges.PrivilegeCount = 1;
+    token_privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (AdjustTokenPrivileges(handle_current_token, FALSE, &token_privileges, 0, (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL) == FALSE)
+    {
+        return FALSE;
+    }
+    return TRUE;
 }
 
 DWORD WINAPI thread_read(struct program_state *state)
@@ -358,7 +397,7 @@ DWORD WINAPI thread_read(struct program_state *state)
 
     while (1)
     {
-        if (state->count >= 0 && state->blocks_read >= state->count)
+        if (state->block_count >= 0 && state->blocks_read >= state->block_count)
         {
             break;
         }
@@ -399,7 +438,7 @@ DWORD WINAPI thread_write(struct program_state *state)
         {
             ReleaseSemaphore(state->mutex_progress_display, 1, NULL);
         }
-        if (state->count >= 0 && state->blocks_write >= state->count)
+        if (state->block_count >= 0 && state->blocks_write >= state->block_count)
         {
             break;
         }
@@ -435,7 +474,7 @@ int main(int argc, char **argv)
     struct program_options options;
     struct program_state state;
     size_t num_blocks_copied = 0;
-    BOOL show_progress = FALSE;
+    BOOL use_large_pages = FALSE;
     size_t last_bytes_copied = 0;
     ULONGLONG last_time = 0;
     DISK_GEOMETRY_EX disk_geometry;
@@ -448,7 +487,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (options.print_drive_list)
+    if (options.print_drive_list == TRUE)
     {
         return system("wmic diskdrive list brief");
     }
@@ -464,6 +503,7 @@ int main(int argc, char **argv)
     state.bytes_write = 0;
     state.blocks_read = 0;
     state.blocks_write = 0;
+    state.block_count = options.count;
 
     if (strcmp(options.filename_in, "-") == 0)
     {
@@ -479,7 +519,7 @@ int main(int argc, char **argv)
     else
     {
 
-        state.in_file = CreateFileA(
+        state.in_file = CreateFile(
             options.filename_in,
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -514,7 +554,7 @@ int main(int argc, char **argv)
          * use OPEN_ALWAYS because it fails when out_file is a physical drive
          * (no idea why).
          */
-        state.out_file = CreateFileA(
+        state.out_file = CreateFile(
             options.filename_out,
             GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -524,7 +564,7 @@ int main(int argc, char **argv)
             NULL);
         if (state.out_file == INVALID_HANDLE_VALUE)
         {
-            state.out_file = CreateFileA(
+            state.out_file = CreateFile(
                 options.filename_out,
                 GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -557,6 +597,7 @@ int main(int argc, char **argv)
     if (state.out_file_is_device)
     {
         DWORD sector_size;
+        size_t requested_size = 0;
 
         if (DeviceIoControl(state.out_file, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, NULL, NULL) == FALSE)
         {
@@ -574,25 +615,53 @@ int main(int argc, char **argv)
         }
 
         sector_size = disk_geometry.Geometry.BytesPerSector;
-        if (options.block_size < sector_size)
+        if (state.block_count > 0)
         {
-            state.buffer_size = sector_size;
+            requested_size = state.buffer_size * state.block_count;
         }
-        else
+        sector_size--;
+        state.buffer_size = (options.block_size + sector_size) & ~sector_size;
+        if (options.block_size > 0 && state.buffer_size != options.block_size)
         {
-            state.buffer_size = (state.buffer_size / sector_size) * sector_size;
+            fprintf(stderr, "Buffer size changed. Requested: %zi Real: %li\n", options.block_size, state.buffer_size);
+            if (state.block_count > 0)
+            {
+                size_t original_block_count = state.block_count;
+                requested_size = (requested_size + sector_size) & ~sector_size;
+                state.block_count = requested_size / state.buffer_size;
+                if (state.block_count != original_block_count)
+                fprintf(stderr, "Block count changed. Requested: %zi Real: %zi\n", state.block_count, original_block_count);
+            }
         }
     }
-    else
+    else if (options.block_size > 0)
     {
-        if (options.block_size > 0)
-        {
-            state.buffer_size = (DWORD)options.block_size; // TODO: Possible bug with bs > 4GB
-        }
+        state.buffer_size = (DWORD)options.block_size; // TODO: Possible bug with bs > 4GB
     }
 
+    size_t large_page_size = GetLargePageMinimum();
+    DWORD large_page_buffer_size;
+    if (state.buffer_size >= large_page_size && enable_windows_privilege("SeLockMemoryPrivilege"))
+    {
+        fprintf(stderr, "LargePage support enabled, size: %zi\n", large_page_size);
+        large_page_size--;
+        large_page_buffer_size = (DWORD)((state.buffer_size + large_page_size) & ~large_page_size);
+    }
     for (int i = 0; i < BUFFER_COUNT; i++)
     {
+        if (use_large_pages)
+        {
+            state.buffer[i] = VirtualAlloc(
+                NULL,
+                large_page_buffer_size,
+                MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+                PAGE_READWRITE);
+            if (state.buffer[i] != NULL)
+            {
+                fprintf(stderr, "Buffer %i large pages allocation failed, fall back to normal allocation.\n", i);
+                continue;
+            }
+        }
         state.buffer[i] = VirtualAlloc(
             NULL,
             state.buffer_size,
@@ -603,22 +672,20 @@ int main(int argc, char **argv)
             exit_on_error(&state, GetLastError(), "Failed to allocate buffer");
         }
     }
-    state.count = options.count;
 
     fprintf(stderr, "\n");
-    show_progress = (options.status != NULL && strcmp(options.status, "progress") == 0);
     state.started_copying = TRUE;
 
     state.semaphore_buffer_ready = CreateSemaphore(NULL, BUFFER_COUNT, BUFFER_COUNT, NULL);
     state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, BUFFER_COUNT, NULL);
-    if (show_progress == TRUE)
+    if (options.show_progress == TRUE)
     {
         state.mutex_progress_display = CreateSemaphore(NULL, 0, 1, NULL);
     }
     state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read, &state, 0, NULL);
     state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write, &state, 0, NULL);
 
-    if (show_progress == TRUE)
+    if (options.show_progress == TRUE)
     {
         while (state.started_copying == TRUE)
         {
@@ -644,7 +711,6 @@ int main(int argc, char **argv)
                 }
             }
         }
-        CloseHandle(state.mutex_progress_display);
     }
 
     WaitForSingleObject(state.handle_thread_read, -1);
