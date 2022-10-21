@@ -153,7 +153,7 @@ static void print_progress(size_t bytes_copied,
     format_speed(speed_str, sizeof(speed_str), speed);
 
     fprintf(stderr,
-            "%zu B (%s) copied, %0.1f s, %s\n",
+            "%zu B (%s) copied, %0.1f s, %s",
             bytes_copied,
             bytes_str,
             (double)elapsed_time / 1000000.0,
@@ -178,7 +178,7 @@ static void clear_output(void)
 
     console = GetStdHandle(STD_ERROR_HANDLE);
     GetConsoleScreenBufferInfo(console, &buffer_info);
-    start_coord.Y = buffer_info.dwCursorPosition.Y - 1;
+    start_coord.Y = buffer_info.dwCursorPosition.Y;
     FillConsoleOutputCharacter(
         console,
         ' ',
@@ -686,6 +686,18 @@ int main(int argc, char **argv)
         large_page_buffer_size = (DWORD)((state.buffer_size + large_page_size) & ~large_page_size);
         use_large_pages = TRUE;
     }
+
+    state.started_copying = TRUE;
+
+    state.semaphore_buffer_ready = CreateSemaphore(NULL, 0, BUFFER_COUNT, NULL);
+    state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, BUFFER_COUNT, NULL);
+    if (options.show_progress == TRUE)
+    {
+        state.mutex_progress_display = CreateSemaphore(NULL, 0, 1, NULL);
+    }
+    state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read, &state, 0, NULL);
+    state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write, &state, 0, NULL);
+
     for (int i = 0; i < BUFFER_COUNT; i++)
     {
         if (use_large_pages == TRUE)
@@ -697,6 +709,7 @@ int main(int argc, char **argv)
                 PAGE_READWRITE);
             if (state.buffer[i] != NULL)
             {
+                ReleaseSemaphore(state.semaphore_buffer_ready, 1, NULL);
                 continue;
             }
             fprintf(stderr, "Buffer %i large pages allocation failed, fall back to normal allocation.\n", i);
@@ -710,19 +723,8 @@ int main(int argc, char **argv)
         {
             exit_on_error(&state, GetLastError(), "Failed to allocate buffer");
         }
+        ReleaseSemaphore(state.semaphore_buffer_ready, 1, NULL);
     }
-
-    fprintf(stderr, "\n");
-    state.started_copying = TRUE;
-
-    state.semaphore_buffer_ready = CreateSemaphore(NULL, BUFFER_COUNT, BUFFER_COUNT, NULL);
-    state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, BUFFER_COUNT, NULL);
-    if (options.show_progress == TRUE)
-    {
-        state.mutex_progress_display = CreateSemaphore(NULL, 0, 1, NULL);
-    }
-    state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read, &state, 0, NULL);
-    state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write, &state, 0, NULL);
 
     if (options.show_progress == TRUE)
     {
