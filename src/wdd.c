@@ -52,6 +52,7 @@ struct program_state
 {
     HANDLE input_file_handle;
     HANDLE output_file_handle;
+    int buffer_count;
     DWORD buffer_size;
     char *buffer[MAX_BUFFER_COUNT];
     BOOL output_file_is_device;
@@ -199,7 +200,7 @@ static char *get_error_message(DWORD error)
 
 static void cleanup(const struct program_state *state)
 {
-    for (int i = 0; i < MAX_BUFFER_COUNT; i++)
+    for (int i = 0; i < state->buffer_count; i++)
     {
         VirtualFree(state->buffer[i], 0, MEM_RELEASE);
     }
@@ -577,10 +578,9 @@ static void allocate_buffer(struct program_state *state)
 {
     BOOL use_large_pages = FALSE;
     DWORD large_page_buffer_size = 0;
-    int buffer_count = MAX_BUFFER_COUNT;
     if (state->input_use_dev_zero == TRUE)
     {
-        buffer_count = 1;
+        state->buffer_count = 1;
     }
     if (enable_windows_privilege("SeLockMemoryPrivilege") == TRUE)
     {
@@ -590,7 +590,7 @@ static void allocate_buffer(struct program_state *state)
         large_page_buffer_size = (DWORD)((state->buffer_size + large_page_size) & ~large_page_size);
         use_large_pages = TRUE;
     }
-    for (int i = 0; i < buffer_count; i++)
+    for (int i = 0; i < state->buffer_count; i++)
     {
         if (use_large_pages == TRUE)
         {
@@ -660,7 +660,7 @@ DWORD WINAPI thread_read_default(struct program_state *state)
         {
             break;
         }
-        buffer_index = state->blocks_read % MAX_BUFFER_COUNT;
+        buffer_index = state->blocks_read % state->buffer_count;
         WaitForSingleObject(state->semaphore_buffer_ready, INFINITE);
         result = ReadFile(
             state->input_file_handle,
@@ -686,6 +686,23 @@ DWORD WINAPI thread_read_default(struct program_state *state)
     return EXIT_SUCCESS;
 }
 
+DWORD WINAPI thread_read_dev_zero(struct program_state *state)
+{
+    state->bytes_read_per_block[0] = state->buffer_size;
+    while (1)
+    {
+        if (state->block_count > 0 && state->blocks_read >= state->block_count)
+        {
+            break;
+        }
+        WaitForSingleObject(state->semaphore_buffer_ready, INFINITE);
+        state->bytes_read += state->bytes_read_per_block[0];
+        state->blocks_read++;
+        ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
+    }
+    return EXIT_SUCCESS;
+}
+
 DWORD WINAPI thread_write_default(struct program_state *state)
 {
     BOOL result;
@@ -701,7 +718,7 @@ DWORD WINAPI thread_write_default(struct program_state *state)
         {
             break;
         }
-        buffer_index = state->blocks_write % MAX_BUFFER_COUNT;
+        buffer_index = state->blocks_write % state->buffer_count;
         WaitForSingleObject(state->semaphore_buffer_occupied, INFINITE);
         if (state->bytes_read_per_block[buffer_index] == 0)
         {
@@ -723,38 +740,6 @@ DWORD WINAPI thread_write_default(struct program_state *state)
         state->bytes_write += state->bytes_write_per_block;
         state->blocks_write++;
         ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
-    }
-    state->started_copying = FALSE;
-    return EXIT_SUCCESS;
-}
-
-DWORD WINAPI thread_write_dev_zero(struct program_state *state)
-{
-    BOOL result;
-    WaitForSingleObject(state->semaphore_buffer_ready, INFINITE);
-    while (1)
-    {
-        if (state->mutex_progress_display != INVALID_HANDLE_VALUE)
-        {
-            ReleaseSemaphore(state->mutex_progress_display, 1, NULL);
-        }
-        if (state->block_count > 0 && state->blocks_write >= state->block_count)
-        {
-            break;
-        }
-        result = WriteFile(
-            state->output_file_handle,
-            state->buffer[0],
-            state->buffer_size,
-            &(state->bytes_write_per_block),
-            NULL);
-        if (result == FALSE)
-        {
-            exit_on_error(state, GetLastError(), "Error writing to file");
-        }
-
-        state->bytes_write += state->bytes_write_per_block;
-        state->blocks_write++;
     }
     state->started_copying = FALSE;
     return EXIT_SUCCESS;
@@ -790,28 +775,28 @@ int main(int argc, char **argv)
     state.blocks_read = 0;
     state.blocks_write = 0;
     state.block_count = options.count;
+    state.buffer_count = MAX_BUFFER_COUNT;
 
     open_input_file(options.input_filename, options.skip_offset, &state);
     open_output_file(options.output_filename, options.seek_offset, &state);
     calculate_buffer_size(options.block_size, &state);
-
     allocate_buffer(&state);
+
     if (options.show_progress == TRUE)
     {
         state.mutex_progress_display = CreateSemaphore(NULL, 0, 1, NULL);
     }
+    state.semaphore_buffer_ready = CreateSemaphore(NULL, state.buffer_count, state.buffer_count, NULL);
+    state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, state.buffer_count, NULL);
     if (state.input_use_dev_zero == TRUE)
     {
-        state.semaphore_buffer_ready = CreateSemaphore(NULL, MAX_BUFFER_COUNT, MAX_BUFFER_COUNT, NULL);
-        state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_dev_zero, &state, 0, NULL);
+        state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read_dev_zero, &state, 0, NULL);
     }
     else
     {
-        state.semaphore_buffer_ready = CreateSemaphore(NULL, MAX_BUFFER_COUNT, MAX_BUFFER_COUNT, NULL);
-        state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, MAX_BUFFER_COUNT, NULL);
         state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read_default, &state, 0, NULL);
-        state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_default, &state, 0, NULL);
     }
+    state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_default, &state, 0, NULL);
 
     state.started_copying = TRUE;
 
