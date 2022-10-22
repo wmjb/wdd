@@ -71,6 +71,7 @@ struct program_state
     DWORD bytes_read_per_block[MAX_BUFFER_COUNT];
     DWORD bytes_write_per_block;
     BOOL input_use_dev_zero;
+    BOOL output_use_dev_null;
 };
 
 static void print_usage(void)
@@ -394,6 +395,10 @@ static BOOL parse_options(int argc,
     {
         options->output_filename = "-";
     }
+    if (strcmp(options->output_filename, "/dev/null") == 0 && strcmp(options->input_filename, "/dev/zero") == 0)
+    {
+        return FALSE;
+    }
     if (options->skip_offset.QuadPart < 0)
     {
         return FALSE;
@@ -455,7 +460,11 @@ static void open_input_file(const char *input_filename, LARGE_INTEGER skip_offse
 
 static void open_output_file(const char *output_filename, LARGE_INTEGER seek_offset, struct program_state *state)
 {
-    if (strcmp(output_filename, "-") == 0)
+    if (strcmp(output_filename, "/dev/null") == 0)
+    {
+        state->output_use_dev_null = TRUE;
+    }
+    else if (strcmp(output_filename, "-") == 0)
     {
         state->output_file_handle = GetStdHandle(STD_OUTPUT_HANDLE);
         if (state->output_file_handle == INVALID_HANDLE_VALUE)
@@ -578,7 +587,7 @@ static void allocate_buffer(struct program_state *state)
 {
     BOOL use_large_pages = FALSE;
     DWORD large_page_buffer_size = 0;
-    if (state->input_use_dev_zero == TRUE)
+    if (state->input_use_dev_zero == TRUE || state->output_use_dev_null == TRUE)
     {
         state->buffer_count = 1;
     }
@@ -742,6 +751,41 @@ DWORD WINAPI thread_write_default(struct program_state *state)
         ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
     }
     state->started_copying = FALSE;
+    if (state->mutex_progress_display != INVALID_HANDLE_VALUE)
+    {
+        ReleaseSemaphore(state->mutex_progress_display, 1, NULL);
+    }
+    return EXIT_SUCCESS;
+}
+
+DWORD WINAPI thread_write_dev_null(struct program_state *state)
+{
+    while (1)
+    {
+        if (state->mutex_progress_display != INVALID_HANDLE_VALUE)
+        {
+            ReleaseSemaphore(state->mutex_progress_display, 1, NULL);
+        }
+        if (state->block_count > 0 && state->blocks_write >= state->block_count)
+        {
+            break;
+        }
+        WaitForSingleObject(state->semaphore_buffer_occupied, INFINITE);
+        if (state->bytes_read_per_block[0] == 0)
+        {
+            ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
+            break;
+        }
+        state->bytes_write_per_block = state->bytes_read_per_block[0];
+        state->bytes_write += state->bytes_write_per_block;
+        state->blocks_write++;
+        ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
+    }
+    state->started_copying = FALSE;
+    if (state->mutex_progress_display != INVALID_HANDLE_VALUE)
+    {
+        ReleaseSemaphore(state->mutex_progress_display, 1, NULL);
+    }
     return EXIT_SUCCESS;
 }
 
@@ -796,7 +840,14 @@ int main(int argc, char **argv)
     {
         state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read_default, &state, 0, NULL);
     }
-    state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_default, &state, 0, NULL);
+    if (state.output_use_dev_null == TRUE)
+    {
+        state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_dev_null, &state, 0, NULL);
+    }
+    else
+    {
+        state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_default, &state, 0, NULL);
+    }
 
     state.started_copying = TRUE;
 
