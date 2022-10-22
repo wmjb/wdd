@@ -601,7 +601,6 @@ static void allocate_buffer(struct program_state *state)
                 PAGE_READWRITE);
             if (state->buffer[i] != NULL)
             {
-                ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
                 continue;
             }
             fprintf(stderr, "Buffer %i large pages allocation failed, fall back to normal allocation.\n", i);
@@ -615,7 +614,6 @@ static void allocate_buffer(struct program_state *state)
         {
             exit_on_error(state, GetLastError(), "Failed to allocate buffer");
         }
-        ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
     }
 }
 
@@ -797,24 +795,25 @@ int main(int argc, char **argv)
     open_output_file(options.output_filename, options.seek_offset, &state);
     calculate_buffer_size(options.block_size, &state);
 
-    state.started_copying = TRUE;
+    allocate_buffer(&state);
     if (options.show_progress == TRUE)
     {
         state.mutex_progress_display = CreateSemaphore(NULL, 0, 1, NULL);
     }
     if (state.input_use_dev_zero == TRUE)
     {
-        state.semaphore_buffer_ready = CreateSemaphore(NULL, 0, MAX_BUFFER_COUNT, NULL);
+        state.semaphore_buffer_ready = CreateSemaphore(NULL, MAX_BUFFER_COUNT, MAX_BUFFER_COUNT, NULL);
         state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_dev_zero, &state, 0, NULL);
     }
     else
     {
-        state.semaphore_buffer_ready = CreateSemaphore(NULL, 0, MAX_BUFFER_COUNT, NULL);
+        state.semaphore_buffer_ready = CreateSemaphore(NULL, MAX_BUFFER_COUNT, MAX_BUFFER_COUNT, NULL);
         state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, MAX_BUFFER_COUNT, NULL);
         state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read_default, &state, 0, NULL);
         state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write_default, &state, 0, NULL);
     }
-    allocate_buffer(&state);
+
+    state.started_copying = TRUE;
 
     if (options.show_progress == TRUE)
     {
