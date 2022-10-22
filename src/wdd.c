@@ -632,9 +632,8 @@ static void show_progress(struct program_state *state)
     ULONGLONG current_time = 0;
     size_t last_bytes_copied = 0;
 
-    while (state->started_copying == TRUE)
+    do
     {
-
         WaitForSingleObject(state->mutex_progress_display, INFINITE);
         current_time = get_time_usec();
         if (last_time == 0)
@@ -643,7 +642,7 @@ static void show_progress(struct program_state *state)
         }
         else
         {
-            if (current_time - last_time >= UPDATE_INTERVAL)
+            if (current_time - last_time >= UPDATE_INTERVAL || state->started_copying == FALSE)
             {
                 clear_output();
                 print_progress(
@@ -655,7 +654,7 @@ static void show_progress(struct program_state *state)
                 last_bytes_copied = state->bytes_write;
             }
         }
-    }
+    } while (state->started_copying == TRUE);
 }
 
 DWORD WINAPI thread_read_default(struct program_state *state)
