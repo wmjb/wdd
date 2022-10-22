@@ -40,8 +40,8 @@ struct program_options
 {
     BOOL print_drive_list;
     BOOL show_progress;
-    const char *filename_in;
-    const char *filename_out;
+    const char *input_filename;
+    const char *output_filename;
     size_t block_size;
     size_t count;
     LARGE_INTEGER skip_offset;
@@ -50,11 +50,11 @@ struct program_options
 
 struct program_state
 {
-    HANDLE in_file;
-    HANDLE out_file;
+    HANDLE input_file_handle;
+    HANDLE output_file_handle;
     DWORD buffer_size;
     char *buffer[BUFFER_COUNT];
-    BOOL out_file_is_device;
+    BOOL output_file_is_device;
     BOOL started_copying;
     ULONGLONG start_time;
     size_t bytes_read;
@@ -210,19 +210,19 @@ static void cleanup(const struct program_state *state)
         VirtualFree(state->buffer[i], 0, MEM_RELEASE);
     }
 
-    if (state->in_file != INVALID_HANDLE_VALUE)
+    if (state->input_file_handle != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(state->in_file);
+        CloseHandle(state->input_file_handle);
     }
 
-    if (state->out_file_is_device)
+    if (state->output_file_is_device)
     {
-        DeviceIoControl(state->out_file, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, NULL, NULL);
+        DeviceIoControl(state->output_file_handle, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, NULL, NULL);
     }
 
-    if (state->out_file != INVALID_HANDLE_VALUE)
+    if (state->output_file_handle != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(state->out_file);
+        CloseHandle(state->output_file_handle);
     }
 
     if (state->handle_thread_read != INVALID_HANDLE_VALUE)
@@ -309,14 +309,36 @@ static BOOL is_empty_string(const char *str)
     return str == NULL || *str == '\0';
 }
 
+static BOOL enable_windows_privilege(LPSTR requested_privilege)
+{
+    /* Tries to enable privilege if it is present to the Permissions set. */
+    HANDLE handle_current_token;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &handle_current_token) == FALSE)
+    {
+        return FALSE;
+    }
+    TOKEN_PRIVILEGES token_privileges;
+    if (LookupPrivilegeValue(NULL, requested_privilege, &(token_privileges.Privileges[0].Luid)) == FALSE)
+    {
+        return FALSE;
+    }
+    token_privileges.PrivilegeCount = 1;
+    token_privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (AdjustTokenPrivileges(handle_current_token, FALSE, &token_privileges, 0, (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL) == FALSE)
+    {
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL parse_options(int argc,
                           char **argv,
                           struct program_options *options)
 {
     options->print_drive_list = FALSE;
     options->show_progress = FALSE;
-    options->filename_in = "-";
-    options->filename_out = "-";
+    options->input_filename = "-";
+    options->output_filename = "-";
     options->block_size = 0;
     options->count = 0;
     options->skip_offset.QuadPart = 0;
@@ -334,11 +356,11 @@ static BOOL parse_options(int argc,
         }
         else if (strcmp(name, "if") == 0)
         {
-            options->filename_in = strdup(value);
+            options->input_filename = strdup(value);
         }
         else if (strcmp(name, "of") == 0)
         {
-            options->filename_out = strdup(value);
+            options->output_filename = strdup(value);
         }
         else if (strcmp(name, "bs") == 0)
         {
@@ -369,13 +391,13 @@ static BOOL parse_options(int argc,
     {
         return FALSE;
     }
-    if (is_empty_string(options->filename_in) == TRUE)
+    if (is_empty_string(options->input_filename) == TRUE)
     {
-        options->filename_in = "-";
+        options->input_filename = "-";
     }
-    if (is_empty_string(options->filename_out) == TRUE)
+    if (is_empty_string(options->output_filename) == TRUE)
     {
-        options->filename_out = "-";
+        options->output_filename = "-";
     }
     if (options->skip_offset.QuadPart < 0)
     {
@@ -388,26 +410,242 @@ static BOOL parse_options(int argc,
     return TRUE;
 }
 
-static BOOL enable_windows_privilege(LPSTR requested_privilege)
+static void open_input_file(const char *input_filename, LARGE_INTEGER skip_offset, struct program_state *state)
 {
-    /* Tries to enable privilege if it is present to the Permissions set. */
-    HANDLE handle_current_token;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &handle_current_token) == FALSE)
+    if (strcmp(input_filename, "-") == 0)
     {
-        return FALSE;
+        state->input_file_handle = GetStdHandle(STD_INPUT_HANDLE);
+        if (state->input_file_handle == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Could not open stdin for reading");
+        }
     }
-    TOKEN_PRIVILEGES token_privileges;
-    if (LookupPrivilegeValue(NULL, requested_privilege, &(token_privileges.Privileges[0].Luid)) == FALSE)
+    else
     {
-        return FALSE;
+        state->input_file_handle = CreateFile(
+            input_filename,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            NULL);
+        if (state->input_file_handle == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Could not open input file or device %s for reading",
+                input_filename);
+        }
+
+        if (SetFilePointer(state->input_file_handle, skip_offset.LowPart, &skip_offset.HighPart, 0) == INVALID_SET_FILE_POINTER)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Input file seek failed. Requested offset: %li",
+                skip_offset.QuadPart);
+        }
     }
-    token_privileges.PrivilegeCount = 1;
-    token_privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (AdjustTokenPrivileges(handle_current_token, FALSE, &token_privileges, 0, (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL) == FALSE)
+    return;
+}
+
+static void open_output_file(const char *output_filename, LARGE_INTEGER seek_offset, struct program_state *state)
+{
+    if (strcmp(output_filename, "-") == 0)
     {
-        return FALSE;
+        state->output_file_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (state->output_file_handle == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Could not open stdout for writing");
+        }
     }
-    return TRUE;
+    else
+    {
+        /* First try to open as an existing file, thne as a new file. We can't
+         * use OPEN_ALWAYS because it fails when out_file is a physical drive
+         * (no idea why).
+         */
+        state->output_file_handle = CreateFile(
+            output_filename,
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+        if (state->output_file_handle == INVALID_HANDLE_VALUE)
+        {
+            state->output_file_handle = CreateFile(
+                output_filename,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                NULL);
+        }
+        if (state->output_file_handle == INVALID_HANDLE_VALUE)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Could not open output file or device %s for writing",
+                output_filename);
+        }
+
+        if (SetFilePointer(state->output_file_handle, seek_offset.LowPart, &seek_offset.HighPart, 0) == INVALID_SET_FILE_POINTER)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Output file seek failed. Requested offset: %li",
+                seek_offset.QuadPart);
+        }
+    }
+    return;
+}
+
+static void calculate_buffer_size(size_t block_size, struct program_state *state)
+{
+    DISK_GEOMETRY_EX disk_geometry;
+    state->buffer_size = DEFAULT_BUFFER_SIZE;
+    state->output_file_is_device = DeviceIoControl(
+        state->output_file_handle,
+        IOCTL_DISK_GET_DRIVE_GEOMETRY,
+        NULL,
+        0,
+        &disk_geometry,
+        sizeof(disk_geometry),
+        NULL,
+        NULL);
+
+    if (state->output_file_is_device)
+    {
+        DWORD sector_size;
+        size_t requested_size = 0;
+
+        if (DeviceIoControl(state->output_file_handle, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, NULL, NULL) == FALSE)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Failed to dismount output volume");
+        }
+        if (DeviceIoControl(state->output_file_handle, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, NULL, NULL) == FALSE)
+        {
+            exit_on_error(
+                state,
+                GetLastError(),
+                "Failed to lock output volume");
+        }
+
+        sector_size = disk_geometry.Geometry.BytesPerSector;
+        if (state->block_count > 0)
+        {
+            requested_size = state->buffer_size * state->block_count;
+        }
+        sector_size--;
+        state->buffer_size = (block_size + sector_size) & ~sector_size;
+        if (block_size > 0 && state->buffer_size != block_size)
+        {
+            fprintf(stderr, "Buffer size changed. Requested: %zi Real: %li\n", block_size, state->buffer_size);
+            if (state->block_count > 0)
+            {
+                size_t original_block_count = state->block_count;
+                requested_size = (requested_size + sector_size) & ~sector_size;
+                state->block_count = requested_size / state->buffer_size;
+                if (state->block_count != original_block_count)
+                {
+                    fprintf(stderr, "Block count changed. Requested: %zi Real: %zi\n", state->block_count, original_block_count);
+                }
+            }
+        }
+    }
+    else if (block_size > 0)
+    {
+        state->buffer_size = (DWORD)block_size; // TODO: Possible bug with bs > 4GB
+    }
+}
+
+static void allocate_buffer(struct program_state *state)
+{
+    BOOL use_large_pages = FALSE;
+    DWORD large_page_buffer_size = 0;
+    if (enable_windows_privilege("SeLockMemoryPrivilege") == TRUE)
+    {
+        size_t large_page_size = GetLargePageMinimum();
+        fprintf(stderr, "LargePage support enabled, size: %zi\n", large_page_size);
+        large_page_size--;
+        large_page_buffer_size = (DWORD)((state->buffer_size + large_page_size) & ~large_page_size);
+        use_large_pages = TRUE;
+    }
+    for (int i = 0; i < BUFFER_COUNT; i++)
+    {
+        if (use_large_pages == TRUE)
+        {
+            state->buffer[i] = VirtualAlloc(
+                NULL,
+                large_page_buffer_size,
+                MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+                PAGE_READWRITE);
+            if (state->buffer[i] != NULL)
+            {
+                ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
+                continue;
+            }
+            fprintf(stderr, "Buffer %i large pages allocation failed, fall back to normal allocation.\n", i);
+        }
+        state->buffer[i] = VirtualAlloc(
+            NULL,
+            state->buffer_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE);
+        if (state->buffer[i] == NULL)
+        {
+            exit_on_error(state, GetLastError(), "Failed to allocate buffer");
+        }
+        ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
+    }
+}
+
+static void show_progress(struct program_state *state)
+{
+    ULONGLONG last_time = 0;
+    ULONGLONG current_time = 0;
+    size_t last_bytes_copied = 0;
+
+    while (state->started_copying == TRUE)
+    {
+
+        WaitForSingleObject(state->mutex_progress_display, INFINITE);
+        current_time = get_time_usec();
+        if (last_time == 0)
+        {
+            last_time = current_time;
+        }
+        else
+        {
+            if (current_time - last_time >= UPDATE_INTERVAL)
+            {
+                clear_output();
+                print_progress(
+                    state->bytes_write,
+                    state->bytes_write - last_bytes_copied,
+                    state->start_time,
+                    last_time);
+                last_time = current_time;
+                last_bytes_copied = state->bytes_write;
+            }
+        }
+    }
 }
 
 DWORD WINAPI thread_read(struct program_state *state)
@@ -422,9 +660,9 @@ DWORD WINAPI thread_read(struct program_state *state)
             break;
         }
         buffer_index = state->blocks_read % BUFFER_COUNT;
-        WaitForSingleObject(state->semaphore_buffer_ready, -1);
+        WaitForSingleObject(state->semaphore_buffer_ready, INFINITE);
         result = ReadFile(
-            state->in_file,
+            state->input_file_handle,
             state->buffer[buffer_index],
             state->buffer_size,
             &(state->bytes_read_per_block[buffer_index]),
@@ -444,7 +682,7 @@ DWORD WINAPI thread_read(struct program_state *state)
         state->blocks_read++;
         ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
     }
-    return 1;
+    return EXIT_SUCCESS;
 }
 
 DWORD WINAPI thread_write(struct program_state *state)
@@ -463,14 +701,14 @@ DWORD WINAPI thread_write(struct program_state *state)
             break;
         }
         buffer_index = state->blocks_write % BUFFER_COUNT;
-        WaitForSingleObject(state->semaphore_buffer_occupied, -1);
+        WaitForSingleObject(state->semaphore_buffer_occupied, INFINITE);
         if (state->bytes_read_per_block[buffer_index] == 0)
         {
             ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
             break;
         }
         result = WriteFile(
-            state->out_file,
+            state->output_file_handle,
             state->buffer[buffer_index],
             state->bytes_read_per_block[buffer_index],
             &(state->bytes_write_per_block),
@@ -486,18 +724,13 @@ DWORD WINAPI thread_write(struct program_state *state)
         ReleaseSemaphore(state->semaphore_buffer_ready, 1, NULL);
     }
     state->started_copying = FALSE;
-    return 1;
+    return EXIT_SUCCESS;
 }
 
 int main(int argc, char **argv)
 {
     struct program_options options;
     struct program_state state;
-    size_t num_blocks_copied = 0;
-    BOOL use_large_pages = FALSE;
-    size_t last_bytes_copied = 0;
-    ULONGLONG last_time = 0;
-    DISK_GEOMETRY_EX disk_geometry;
 
     ZeroMemory(&options, sizeof(options));
 
@@ -513,11 +746,11 @@ int main(int argc, char **argv)
     }
 
     ZeroMemory(&state, sizeof(state));
-    state.in_file = INVALID_HANDLE_VALUE;
-    state.out_file = INVALID_HANDLE_VALUE;
+    state.input_file_handle = INVALID_HANDLE_VALUE;
+    state.output_file_handle = INVALID_HANDLE_VALUE;
     state.mutex_progress_display = INVALID_HANDLE_VALUE;
     state.start_time = get_time_usec();
-    state.out_file_is_device = FALSE;
+    state.output_file_is_device = FALSE;
     state.started_copying = FALSE;
     state.bytes_read = 0;
     state.bytes_write = 0;
@@ -525,170 +758,11 @@ int main(int argc, char **argv)
     state.blocks_write = 0;
     state.block_count = options.count;
 
-    if (strcmp(options.filename_in, "-") == 0)
-    {
-        state.in_file = GetStdHandle(STD_INPUT_HANDLE);
-        if (state.in_file == INVALID_HANDLE_VALUE)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Could not open stdin for reading");
-        }
-    }
-    else
-    {
-        state.in_file = CreateFile(
-            options.filename_in,
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-            NULL);
-        if (state.in_file == INVALID_HANDLE_VALUE)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Could not open input file or device %s for reading",
-                options.filename_in);
-        }
-        if (SetFilePointer(state.in_file, options.skip_offset.LowPart, &options.skip_offset.HighPart, 0) == INVALID_SET_FILE_POINTER)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Input file seek failed. Requested offset: %li",
-                options.skip_offset.QuadPart);
-        }
-    }
-
-    if (strcmp(options.filename_out, "-") == 0)
-    {
-        state.out_file = GetStdHandle(STD_OUTPUT_HANDLE);
-        if (state.out_file == INVALID_HANDLE_VALUE)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Could not open stdout for writing");
-        }
-    }
-    else
-    {
-        /* First try to open as an existing file, thne as a new file. We can't
-         * use OPEN_ALWAYS because it fails when out_file is a physical drive
-         * (no idea why).
-         */
-        state.out_file = CreateFile(
-            options.filename_out,
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL);
-        if (state.out_file == INVALID_HANDLE_VALUE)
-        {
-            state.out_file = CreateFile(
-                options.filename_out,
-                GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                NULL,
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
-                NULL);
-        }
-        if (state.out_file == INVALID_HANDLE_VALUE)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Could not open output file or device %s for writing",
-                options.filename_out);
-        }
-
-        if (SetFilePointer(state.out_file, options.seek_offset.LowPart, &options.seek_offset.HighPart, 0) == INVALID_SET_FILE_POINTER)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Output file seek failed. Requested offset: %li",
-                options.seek_offset.QuadPart);
-        }
-    }
-
-    state.buffer_size = DEFAULT_BUFFER_SIZE;
-    state.out_file_is_device = DeviceIoControl(
-        state.out_file,
-        IOCTL_DISK_GET_DRIVE_GEOMETRY,
-        NULL,
-        0,
-        &disk_geometry,
-        sizeof(disk_geometry),
-        NULL,
-        NULL);
-
-    if (state.out_file_is_device)
-    {
-        DWORD sector_size;
-        size_t requested_size = 0;
-
-        if (DeviceIoControl(state.out_file, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, NULL, NULL) == FALSE)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Failed to dismount output volume");
-        }
-        if (DeviceIoControl(state.out_file, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, NULL, NULL) == FALSE)
-        {
-            exit_on_error(
-                &state,
-                GetLastError(),
-                "Failed to lock output volume");
-        }
-
-        sector_size = disk_geometry.Geometry.BytesPerSector;
-        if (state.block_count > 0)
-        {
-            requested_size = state.buffer_size * state.block_count;
-        }
-        sector_size--;
-        state.buffer_size = (options.block_size + sector_size) & ~sector_size;
-        if (options.block_size > 0 && state.buffer_size != options.block_size)
-        {
-            fprintf(stderr, "Buffer size changed. Requested: %zi Real: %li\n", options.block_size, state.buffer_size);
-            if (state.block_count > 0)
-            {
-                size_t original_block_count = state.block_count;
-                requested_size = (requested_size + sector_size) & ~sector_size;
-                state.block_count = requested_size / state.buffer_size;
-                if (state.block_count != original_block_count)
-                {
-                    fprintf(stderr, "Block count changed. Requested: %zi Real: %zi\n", state.block_count, original_block_count);
-                }
-            }
-        }
-    }
-    else if (options.block_size > 0)
-    {
-        state.buffer_size = (DWORD)options.block_size; // TODO: Possible bug with bs > 4GB
-    }
-
-    DWORD large_page_buffer_size;
-    if (enable_windows_privilege("SeLockMemoryPrivilege") == TRUE)
-    {
-        size_t large_page_size = GetLargePageMinimum();
-        fprintf(stderr, "LargePage support enabled, size: %zi\n", large_page_size);
-        large_page_size--;
-        large_page_buffer_size = (DWORD)((state.buffer_size + large_page_size) & ~large_page_size);
-        use_large_pages = TRUE;
-    }
+    open_input_file(options.input_filename, options.skip_offset, &state);
+    open_output_file(options.output_filename, options.seek_offset, &state);
+    calculate_buffer_size(options.block_size, &state);
 
     state.started_copying = TRUE;
-
     state.semaphore_buffer_ready = CreateSemaphore(NULL, 0, BUFFER_COUNT, NULL);
     state.semaphore_buffer_occupied = CreateSemaphore(NULL, 0, BUFFER_COUNT, NULL);
     if (options.show_progress == TRUE)
@@ -698,64 +772,15 @@ int main(int argc, char **argv)
     state.handle_thread_read = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_read, &state, 0, NULL);
     state.handle_thread_write = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)thread_write, &state, 0, NULL);
 
-    for (int i = 0; i < BUFFER_COUNT; i++)
-    {
-        if (use_large_pages == TRUE)
-        {
-            state.buffer[i] = VirtualAlloc(
-                NULL,
-                large_page_buffer_size,
-                MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
-                PAGE_READWRITE);
-            if (state.buffer[i] != NULL)
-            {
-                ReleaseSemaphore(state.semaphore_buffer_ready, 1, NULL);
-                continue;
-            }
-            fprintf(stderr, "Buffer %i large pages allocation failed, fall back to normal allocation.\n", i);
-        }
-        state.buffer[i] = VirtualAlloc(
-            NULL,
-            state.buffer_size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE);
-        if (state.buffer[i] == NULL)
-        {
-            exit_on_error(&state, GetLastError(), "Failed to allocate buffer");
-        }
-        ReleaseSemaphore(state.semaphore_buffer_ready, 1, NULL);
-    }
+    allocate_buffer(&state);
 
     if (options.show_progress == TRUE)
     {
-        while (state.started_copying == TRUE)
-        {
-            ULONGLONG current_time;
-            WaitForSingleObject(state.mutex_progress_display, -1);
-            current_time = get_time_usec();
-            if (last_time == 0)
-            {
-                last_time = current_time;
-            }
-            else
-            {
-                if (current_time - last_time >= UPDATE_INTERVAL)
-                {
-                    clear_output();
-                    print_progress(
-                        state.bytes_write,
-                        state.bytes_write - last_bytes_copied,
-                        state.start_time,
-                        last_time);
-                    last_time = current_time;
-                    last_bytes_copied = state.bytes_write;
-                }
-            }
-        }
+        show_progress(&state);
     }
 
-    WaitForSingleObject(state.handle_thread_read, -1);
-    WaitForSingleObject(state.handle_thread_write, -1);
+    WaitForSingleObject(state.handle_thread_read, INFINITE);
+    WaitForSingleObject(state.handle_thread_write, INFINITE);
 
     cleanup(&state);
     clear_output();
