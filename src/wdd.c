@@ -676,15 +676,13 @@ DWORD WINAPI thread_read_default(struct program_state *state)
             state->buffer_size,
             &(state->bytes_read_per_block[buffer_index]),
             NULL);
-        if (state->bytes_read_per_block[buffer_index] == 0 || (result == FALSE && GetLastError() == ERROR_SECTOR_NOT_FOUND))
+        if (state->bytes_read_per_block[buffer_index] == 0 || result == FALSE)
         {
             ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
+            if (GetLastError() != ERROR_SECTOR_NOT_FOUND) {
+                exit_on_error(state, GetLastError(), "Error reading from file");
+            }
             break;
-        }
-        if (result == FALSE)
-        {
-            ReleaseSemaphore(state->semaphore_buffer_occupied, 1, NULL);
-            exit_on_error(state, GetLastError(), "Error reading from file");
         }
 
         state->bytes_read += state->bytes_read_per_block[buffer_index];
@@ -857,10 +855,10 @@ int main(int argc, char **argv)
 
     WaitForSingleObject(state.handle_thread_read, INFINITE);
     WaitForSingleObject(state.handle_thread_write, INFINITE);
+    print_status(state.bytes_write, state.start_time);
 
     cleanup(&state);
     clear_output();
-    print_status(state.bytes_write, state.start_time);
 
     return EXIT_SUCCESS;
 }
