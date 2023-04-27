@@ -1,20 +1,14 @@
 version: '{build}'
-image: Visual Studio 2019
-
-platform:
-#    - Win32
-#    - x64
-    - ARM
-#    - ARM64
+image: Visual Studio 2017
 
 configuration:
-
   - Release
 
 before_build:
-    - cmake . -G "Visual Studio 16 2019" -A %PLATFORM%
-    
+  - cmake . -G "Visual Studio 15 2017"
+
 build_script:
   - cmake --build . --config %CONFIGURATION%
-artifacts:
-    - path: wdd*.*
+  
+#artifacts:
+#    - path: wdd*.*
