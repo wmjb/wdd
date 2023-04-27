@@ -1,23 +1,13 @@
 version: '{build}'
 image: Visual Studio 2017
 
-platform:
-#    - Win32
-#    - x64
-    - ARM
-#    - ARM64
-
 configuration:
-    - Release
+  - Release
 
 before_build:
-    - cmake . -G "Visual Studio 15 2017" -A %PLATFORM%
+  - cmake . -G "Visual Studio 15 2017" -A ARM
 
 build_script:
-    - cmake --build . --config %CONFIGURATION%
-
-after_build:
-    - cmake --build . --target package --config %CONFIGURATION%
-
+  - cmake --build . --config %CONFIGURATION%
 artifacts:
-    - path: wdd-*.zip
+    - path: wdd*.*
